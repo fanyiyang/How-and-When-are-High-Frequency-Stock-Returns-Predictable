@@ -1,6 +1,3 @@
-I'll create a comprehensive README file for the repository **How and When are High-Frequency Stock Returns Predictable?** This will include an overview of the project, installation and usage instructions, dataset details, methodologies, contributor information, and license details. I'll get back to you once it's ready.
-
-# How and When are High-Frequency Stock Returns Predictable?
 
 ## Project Overview  
 **How and When are High-Frequency Stock Returns Predictable?** is a research project exploring the predictability of ultra high-frequency stock returns (and the time between trades, or **durations**) using detailed market data and machine learning techniques ([EconPapers: How and When are High-Frequency Stock Returns Predictable?](https://econpapers.repec.org/RePEc:nbr:nberwo:30366#:~:text=Abstract%3A%20This%20paper%20studies%20the,data%20on%20a%20scale%20of)).This repository provides the code to reproduce the findings that **short-horizon stock returns can be predicted with meaningful accuracy using microstructure data**, identifying *when* (under what market conditions and timeframes) and *how* (with which features and models) such predictability arises.
