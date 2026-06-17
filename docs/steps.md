@@ -2,6 +2,37 @@
 
 This document explains what each core script does, what it reads, and what it writes.
 
+## 0. `MatchingEngine.py`
+The order-book matching engine that `load_data_and_build_feature.py` depends on
+(`from MatchingEngine import Engine, Side`). It is **not** a PyPI package — it lives
+in this repo. See issue #2.
+
+**Purpose:** Replay raw Shenzhen Stock Exchange tick feeds (order submissions,
+cancellations, trades) to reconstruct the limit order book, the execution stream, and
+order-book snapshots.
+
+**Key classes:**
+- `Side` — `BUY` / `SELL` enum.
+- `Order` — a single order (id, price, qty, type, side, time).
+- `OrderBook` / `NormalOrderBook` / `FreezeOrderBook` — bid/ask depth, snapshots,
+  matching via price-time priority. `FreezeOrderBook` implements the ChiNext
+  "freeze" (鸽笼) ±2% price-cage rule.
+- `Engine` — orchestrates the call auction + continuous auction for one stock-day.
+- `Data` — loads and normalizes the raw per-day CSVs.
+
+**Inputs:** per-day files under `<file_path>/<stock>.XSHE/<year>/<MMDD>/`:
+`am_/pm_hq_order_spot.csv`, `am_/pm_hq_trade_spot.csv`,
+`am_/pm_snap_level_spot.csv`, `am_hq_snap_spot.csv` (GBK-encoded).
+
+**Typical use:**
+```python
+engine = Engine(stock="000001.XSHE", year=2020, month=1, day=2, file_path=file_path)
+engine.main_matching_process(execute_flag=True, execute_rule="trade_before", execute_level_num=1)
+execute_total_df = pd.DataFrame(engine.order_book.execute_total_list)
+```
+
+**Note:** You must supply your own tick data in the layout above; none is bundled.
+
 ## 1. `load_data_and_build_feature.py`
 This script has two stages: **raw data loading** and **feature/label construction**.
 
