@@ -1,38 +1,45 @@
 """
-Matching Engine for Shenzhen Stock Exchange data
+Matching engine for Shenzhen Stock Exchange tick data.
+
+Replays the exchange's order and trade feeds to reconstruct the limit order
+book, the execution stream, and order-book snapshots. Supports the normal
+continuous-auction rule, the ChiNext "freeze" (鸽笼) price-cage rule, and the
+opening call auction.
+
 Author: Yufan Chen
 Last update: 2023.3.10
 
-version 2023.3.10 增加了execute_level_num参数
-version 2023.2.13 解决了补全market order类型时全天没有market order会报错的问题
-                解决了engine.rule设置规则有误的问题
-                解决了取消订单后没有defreeze的问题
-                解决了market order补全全额成交或撤销的类型
-                在snap_total_df中加入了order_id和typ字段
-version 2023.2.12 更新了execute_df中存储成交前snapshot的方式, 引入last_snap_shot
-version 2023.2.11 更新了生成snap_total_df的四种方式
-version 2023.2.10 更新了main_matching_processs的snap_level_num参数
-version 2023.2.9 更新了取当天日内时间时 % 1e9有误差的问题
+Changelog:
+    2023.3.10 added the execute_level_num parameter
+    2023.2.13 fixed a crash when a day contains no market orders;
+              fixed the engine.rule selection;
+              defreeze is now re-checked after order cancellation;
+              market orders that fully fill or cancel get a proper type;
+              snap_total_df rows now carry order_id and typ
+    2023.2.12 execute_df stores the pre-trade snapshot via last_snap_shot
+    2023.2.11 four snapshot-generation modes for snap_total_df
+    2023.2.10 added the snap_level_num parameter to main_matching_process
+    2023.2.9  intraday time is taken via string slicing because float
+              "% 1e9" loses precision
 
-
-说明: 20190104, 20190314, 20190315这三天的数据有问题, 请勿使用.
+Data note: 20190104, 20190314 and 20190315 are known-bad days in the raw
+data; do not use them.
 """
 
+import heapq
 import os
+from decimal import Decimal, ROUND_HALF_UP
+from enum import Enum
+
 import numpy as np
 import pandas as pd
-import datetime
-from _pydecimal import Decimal, ROUND_HALF_UP
-from enum import Enum
-import heapq
 
 
 def _my_round(x, n: int) -> float:
-    """ 自定义的四舍五入函数.
+    """Round ``x`` half-up to ``n`` decimal places.
 
-    :param x: 需要四舍五入的数.
-    :param n: 保留的小数位数.
-    :return: 四舍五入的结果.
+    The 1e-8 nudge keeps values like 2.675 (stored as 2.67499...) from
+    rounding down due to binary float representation.
     """
     return float(Decimal(str(x + 1e-8)).quantize(Decimal('1.' + '0' * n), ROUND_HALF_UP))
 
@@ -57,7 +64,9 @@ class Order:
         qty: int
             Quote quantity of the order.
         typ: str
-            Type of the order. (2: limit order, U: 本方最优, MU: 对方最优, M:marker order, 5C: 五档成交剩余撤销)
+            Type of the order. (2: limit order, U: best price on own side 本方最优,
+            MU: best price on opposite side 对方最优, M: market order,
+            5C: fill against the top five levels then cancel the rest 五档成交剩余撤销)
         cum_qty: int
             The quantity that the order has been executed.
         leaves_qty: int
@@ -133,7 +142,7 @@ class OrderBook:
             depth = self.asks.setdefault(price, [])
         depth.append(order)
 
-        #
+        # update the aggregated size at this price level
         if side == Side.BUY:
             snap_qty = self.bids_snap.setdefault(price, 0)
             self.bids_snap[price] = snap_qty + qty
@@ -262,7 +271,6 @@ class NormalOrderBook(OrderBook):
         snap_row['order_id'] = order_id
         snap_row['typ'] = typ
         self.snap_total_list.append(snap_row)
-        pass
 
     def gen_snap_shot(self, level_num=10):
         """ Generate the snap shot.
@@ -281,11 +289,6 @@ class NormalOrderBook(OrderBook):
         self.update_best_price()
 
         snap_shot = {}
-        # bid_price_list = list(self.bids.keys())
-        # ask_price_list = list(self.asks.keys())
-        # bid_price_list.sort(reverse=True)
-        # ask_price_list.sort()
-
         bid_price_list = heapq.nlargest(level_num, list(self.bids_snap.keys()))
         ask_price_list = heapq.nsmallest(level_num, list(self.asks_snap.keys()))
 
@@ -321,6 +324,11 @@ class NormalOrderBook(OrderBook):
         debug_flag: bool
         execute_flag: bool
             Update execute_total_list or not
+        execute_rule: {"trade_before", "trade_after"}
+            Which order-book snapshot to attach to each execution row:
+            the book just before the incoming order ("trade_before",
+            via last_snap_shot) or the book right after the trade
+            ("trade_after").
         Returns
         -------
 
@@ -346,9 +354,6 @@ class NormalOrderBook(OrderBook):
                 trade_price = None
                 direction = None
 
-            # if snap_flag and snap_rule == "trade_before":
-            #     self.update_snap_total_df(time, snap_level_num=snap_level_num)
-
             bid_order.cum_qty += match_qty
             bid_order.leaves_qty -= match_qty
             if bid_order.leaves_qty < 1e-9:
@@ -372,65 +377,18 @@ class NormalOrderBook(OrderBook):
                 del self.asks_snap[best_ask_price]
 
             best_bid_price, best_ask_price = self.update_best_price()
-            # if (best_bid_price is not None) and (best_ask_price is not None):
-            #     mid_price = 0.5 * (best_bid_price + best_ask_price)
-            # else:
-            #     mid_price = None
-
-            # if snap_flag and snap_rule == "trade_after":
-            #     self.update_snap_total_df(time, snap_level_num=snap_level_num)
 
             if execute_flag:
+                execute_row = {'Time': time,
+                               'BidApplSeqNum': bid_order.order_id,
+                               'OfferApplSeqNum': ask_order.order_id,
+                               'TradeQty': match_qty,
+                               'Price': trade_price,
+                               "Direction": direction, }
                 if execute_rule == "trade_before":
-                    # execute_row = {'Time': time,
-                    #                'BidApplSeqNum': bid_order.order_id,
-                    #                'OfferApplSeqNum': ask_order.order_id,
-                    #                'TradeQty': match_qty,
-                    #                'Price': trade_price,
-                    #                "Direction": direction,
-                    #                "BidPX1": self.last_snap_shot['BidPX1'],
-                    #                "OfferPX1": self.last_snap_shot['OfferPX1'],
-                    #                "BidSize1": self.last_snap_shot['BidSize1'],
-                    #                "OfferSize1": self.last_snap_shot['OfferSize1']
-                    #                }
-                    execute_row = {'Time': time,
-                                   'BidApplSeqNum': bid_order.order_id,
-                                   'OfferApplSeqNum': ask_order.order_id,
-                                   'TradeQty': match_qty,
-                                   'Price': trade_price,
-                                   "Direction": direction, }
                     execute_row.update(self.last_snap_shot)
                 elif execute_rule == "trade_after":
-                    snap_shot = self.gen_snap_shot(level_num=execute_level_num)
-                    # last_bid_price = self.last_snap_shot['BidPX1']
-                    # last_ask_price = self.last_snap_shot['OfferPX1']
-                    # last_bid_size = self.last_snap_shot['BidSize1']
-                    # last_ask_size = self.last_snap_shot['OfferSize1']
-                    # if (last_bid_price is not None) and (last_ask_price is not None):
-                    #     mid_price = 0.5 * (last_bid_price + last_ask_price)
-                    #     wavg_price = (last_bid_size * last_bid_price + last_ask_size * last_ask_price) / (
-                    #                 last_bid_size + last_ask_size)
-                    # else:
-                    #     mid_price = None
-                    #     wavg_price = None
-                    execute_row = {'Time': time,
-                                   'BidApplSeqNum': bid_order.order_id,
-                                   'OfferApplSeqNum': ask_order.order_id,
-                                   'TradeQty': match_qty,
-                                   'Price': trade_price,
-                                   "Direction": direction, }
-                    execute_row.update(snap_shot)
-                    # execute_row = {'Time': time,
-                    #                'BidApplSeqNum': bid_order.order_id,
-                    #                'OfferApplSeqNum': ask_order.order_id,
-                    #                'TradeQty': match_qty,
-                    #                'Price': trade_price,
-                    #                "Direction": direction,
-                    #                "BidPX1": snap_shot['BidPX1'],
-                    #                "OfferPX1": snap_shot['OfferPX1'],
-                    #                "BidSize1": snap_shot['BidSize1'],
-                    #                "OfferSize1": snap_shot['OfferSize1']
-                    #                }
+                    execute_row.update(self.gen_snap_shot(level_num=execute_level_num))
                 execute_list.append(execute_row)
 
         if new_order_id_list is None:  # TODO: call auction: determine the trade price
@@ -448,7 +406,11 @@ class NormalOrderBook(OrderBook):
 
 
 class FreezeOrderBook(OrderBook):
-    """ A class to construct a freeze order book.
+    """ A holding pen for orders frozen by the ChiNext price-cage (鸽笼) rule.
+
+    Limit orders priced more than 2% away from the opposite best price are
+    parked here instead of entering the live book, and are released
+    (defreezed) once the market moves within range.
 
     Attributes:
     bids: dict
@@ -468,7 +430,11 @@ class FreezeOrderBook(OrderBook):
         super().__init__()
 
     def update_best_price(self):
-        """ Update the best bid and ask price of the limit order book.
+        """ Update the best bid and ask price of the freeze order book.
+
+        Note the min/max are the reverse of a normal book: frozen bids are
+        priced ABOVE the cage, so the lowest frozen bid is the first to
+        become releasable (and vice versa for asks).
 
         Returns
         -------
@@ -584,29 +550,31 @@ class Engine:
             side = getattr(row, 'Side')
             typ = getattr(row, 'Type')
             time = getattr(row, 'time')
-            if typ == '2':  # 限价订单
+            if typ == '2':  # limit order
                 order = Order(order_id, price, qty, typ, side, time)
                 self.order_book.add_order(order)
-            elif typ == '4':
-                # if order_id == "232304":
-                #     print("1")
-                # break
+            elif typ == '4':  # cancellation
                 self.order_book.cancel_order(order_id)
         self.order_book.renew(time=92500000, execute_flag=execute_flag, execute_level_num=execute_level_num)
         return None
 
     def market_order_price(self, typ: str, side):
-        """ Determine the equivalent price of a market order.
+        """ Determine the equivalent limit price of a market order.
 
-        "U": 本方的最优价格. (如果本方订单簿为空则设为不可能成交的价格, 因为马上就会撤销.)
-        "MU": 对方的最优价格.
-        "5C": 对方的第五档价格. (不足五档设为最高挡, 为空则设为不可能成交的价格, 因为马上就会撤销.)
-        "M": 对方涨停/跌停价格.
+        "U": best price on the order's own side. (If that side of the book is
+             empty, use an unfillable price -- the order is cancelled right after.)
+        "MU": best price on the opposite side.
+        "5C": fifth-best price on the opposite side. (Fewer than five levels:
+              use the deepest available; empty book: an unfillable price,
+              since the remainder is cancelled immediately.)
+        "M": up-limit/down-limit price, i.e. cross the whole opposite book.
+        "MC": an order with no fills at all; priced to never trade because it
+              is about to be cancelled.
 
         Parameters
         ----------
         typ: str
-            Type of the order. (2: limit order, U: 本方最优, MU: 对方最优, M:market order, 5C: 五档成交剩余撤销)
+            Type of the order (see Order.typ).
         side: Side
             Side of the order.
 
@@ -633,13 +601,13 @@ class Engine:
         elif typ == '5C':
             if side == Side.BUY:
                 asks_len = len(asks.keys())
-                if asks_len == 0:  # 说明对面的订单簿上一个订单都没有, 这时只要保证不会成交就行, 后面紧接着就会撤销掉!
+                if asks_len == 0:  # opposite book is empty; any unfillable price works, the order is cancelled next
                     price = high_stop_price
                 else:
                     price = sorted(list(asks.keys()))[min(asks_len, 5) - 1]
             elif side == Side.SELL:
                 bids_len = len(bids.keys())
-                if bids_len == 0:  # 说明对面的订单簿上一个订单都没有, 这时只要保证不会成交就行, 后面紧接着就会撤销掉!
+                if bids_len == 0:  # opposite book is empty; any unfillable price works, the order is cancelled next
                     price = low_stop_price
                 else:
                     price = sorted(list(bids.keys()))[-min(bids_len, 5)]
@@ -648,7 +616,7 @@ class Engine:
                 price = high_stop_price
             elif side == Side.SELL:
                 price = low_stop_price
-        elif typ == 'MC':  # 完全没有成交记录的单子是一定会被撤销掉的
+        elif typ == 'MC':  # an order with no fills at all is always cancelled
             if side == Side.BUY:
                 price = low_stop_price
             elif side == Side.SELL:
@@ -662,11 +630,13 @@ class Engine:
                            execute_level_num=None):
         """ Conduct a continuous auction along all the order submission and cancellation in the match_df.
 
-        对每一个订单进行如下操作:
-        1. 取消订单: 直接到对应的orderbook里取消即可
-        2. 提交订单: 统一转化成limit order.
-            - 正常规则: 直接加到order book里然后renew order book.
-            - 鸽笼规则: 先判断是否需要冻住订单, 不冻住的话提交订单, 而后不断解冻满足条件的订单直至无法解冻.
+        For each event:
+        1. Cancellation: remove the order from whichever book holds it.
+        2. Submission: convert everything to a limit order first.
+            - normal rule: add to the order book, then renew (match) it.
+            - freeze (price-cage) rule: park the order in the freeze book if it
+              is priced outside the cage; otherwise submit it, then keep
+              releasing frozen orders that came back in range until none qualify.
 
         Parameters
         ----------
@@ -704,9 +674,6 @@ class Engine:
                 self.order_book.update_snap_total_df(time, order_id, typ, snap_level_num=snap_level_num)
 
             if typ == '4':
-                if order_id == 5151290:
-                    print("1")
-                    break
                 if order_id in order_book.order_id_map.keys():
                     order_book.cancel_order(order_id)
                 elif order_id in freeze_order_book.order_id_map.keys():
@@ -716,9 +683,6 @@ class Engine:
                 if typ != '2':
                     price = self.market_order_price(typ, side)
                 order = Order(order_id, price, qty, typ, side, time)
-                # if order_id == 17655216:
-                #     print("1")
-                #     break
                 if (break_order_id is not None) and (order_id == break_order_id):
                     print(order)
                     break
@@ -763,12 +727,14 @@ class Engine:
 
             if snap_flag and snap_rule == "order_after":
                 self.order_book.update_snap_total_df(time, order_id, typ, snap_level_num=snap_level_num)
-        pass
 
     def main_matching_process(self, debug_flag: bool = False, check_flag=False, execute_flag=False, snap_flag=False,
                               snap_level_num=None, snap_rule="order_before", execute_rule="trade_after",
                               execute_level_num=None):
-        """ A integrated procedure to conduct the matching in the day.
+        """ Run one full stock-day: opening call auction, then continuous auction.
+
+        With check_flag=True the reconstructed executions are compared against
+        the exchange's own trade feed as a correctness check.
 
         Returns
         -------
@@ -801,15 +767,8 @@ class Engine:
                 (self.data.execute_df['time'] >= cont_begin_time) & (self.data.execute_df['time'] <= cont_end_time)]
             execute_df = execute_df[execute_check_column].reset_index(drop=True)
 
-            # for i in range(min(len(execute_df),len(execute_total_df))):
-            #     if (execute_df.loc[i] != execute_total_df.loc[i]).any():
-            #         print(execute_df.loc[i])
-            #         print(execute_total_df.loc[i])
-            #         break
             assert len(execute_df) == len(execute_total_df), \
                 f"{self.stock}, {self.year}, {self.month}, {self.day}, Wrong Matching! Contact the author to debug!"
-            # assert ((len(execute_df) == len(execute_total_df)) and (execute_df == execute_total_df).all().all()), \
-            #     f"{self.stock}, {self.year}, {self.month}, {self.day}, Wrong Matching! Contact the author to debug!"
             print(f"{self.stock}, {self.year}, {self.month}, {self.day}, Correct Matching!")
         return None
 
@@ -869,7 +828,7 @@ class Data:
                                  str(self.year),
                                  str(self.month).zfill(2) + str(self.day).zfill(2))
 
-        # snap: 证券快照行情档位表
+        # snap: snapshot price-level table (证券快照行情档位表)
         am_snap_level_spot = pd.read_csv(os.path.join(data_path, 'am_snap_level_spot.csv'), encoding='GBK')
         pm_snap_level_spot = pd.read_csv(os.path.join(data_path, 'pm_snap_level_spot.csv'), encoding='GBK')
         snap_df = pd.concat([am_snap_level_spot, pm_snap_level_spot], ignore_index=True)
@@ -878,7 +837,7 @@ class Data:
             snap_df['BidPX' + str(i)] = snap_df['BidPX' + str(i)].round(3)
         self.snap_df = snap_df
 
-        # order: 逐笔委托行情表
+        # order: tick-by-tick order table (逐笔委托行情表)
         am_hq_order_spot = pd.read_csv(os.path.join(data_path, 'am_hq_order_spot.csv'),
                                        encoding='GBK', dtype={'OrderType': str})
         pm_hq_order_spot = pd.read_csv(os.path.join(data_path, 'pm_hq_order_spot.csv'),
@@ -888,7 +847,7 @@ class Data:
         order_df['Price'] = order_df['Price'].round(3)
         self.order_df = order_df
 
-        # trade: 逐笔成交表
+        # trade: tick-by-tick trade table (逐笔成交表)
         am_hq_trade_spot = pd.read_csv(os.path.join(data_path, 'am_hq_trade_spot.csv'),
                                        encoding='GBK')
         pm_hq_trade_spot = pd.read_csv(os.path.join(data_path, 'pm_hq_trade_spot.csv'),
@@ -928,13 +887,13 @@ class Data:
         trade_df_used = self.trade_df[trade_columns_used].copy()
 
         execute_df = trade_df_used[trade_df_used['ExecType'] == 'F'].copy()
-        # execute_df['time'] = (execute_df['tradetime'] % 1e9).astype(np.int64)
+        # intraday time via string slicing: float "% 1e9" loses precision
         execute_df['time'] = execute_df['tradetime'].apply(lambda x: int(str(x)[-9:]))
         execute_df = execute_df[execute_df['time'] <= 145700000]
         execute_df = execute_df.reset_index(drop=True)
 
         cancel_df = self.trade_df[self.trade_df['ExecType'] == '4'].copy()
-        # 2019年的数据的cancel的对手方orderID是空值, 要补成0
+        # in the 2019 data the counterparty order id of a cancel is empty; fill with 0
         cancel_df['OfferApplSeqNum'] = cancel_df['OfferApplSeqNum'].fillna(0)
         cancel_df['BidApplSeqNum'] = cancel_df['BidApplSeqNum'].fillna(0)
         cancel_df.loc[:, 'Side'] = np.where(cancel_df['OfferApplSeqNum'] == 0, Side.BUY, Side.SELL)
@@ -945,7 +904,6 @@ class Data:
 
         match_df = pd.concat([order_df_used, cancel_df], ignore_index=True)
         match_df = match_df.sort_values('EventID', kind='mergesort')
-        # match_df['time'] = (match_df['time'] % 1e9).astype(np.int64)
         match_df['time'] = match_df['time'].apply(lambda x: int(str(x)[-9:]))
 
         buy_market_id_list = match_df[(match_df['Type'] == '1') & (match_df['Side'] == Side.BUY)]['OrderID'].to_list()
@@ -969,7 +927,6 @@ class Data:
 
             market_order_df = pd.concat([bid_market_order_df, ask_market_order_df], ignore_index=True)
 
-            # if len(market_order_df) > 0:
             market_order_df['cancel_bool'] = market_order_df['OrderID'].isin(cancel_df['OrderID'])
 
             def _market_order_type(row):
@@ -986,7 +943,7 @@ class Data:
                 market_order_df['typ'] = []
             market_order_df = market_order_df.merge(pd.DataFrame(index=market_id_list), left_on='OrderID',
                                                     right_index=True, how='outer')
-            market_order_df['typ'] = market_order_df['typ'].fillna('MC')  # 说明完全没有成交记录, 准备直接撤销掉
+            market_order_df['typ'] = market_order_df['typ'].fillna('MC')  # no fills at all: will be cancelled outright
             market_order_type_dict = market_order_df.groupby('typ')['OrderID'].unique().to_dict()
             for typ, market_id_list in market_order_type_dict.items():
                 match_df.loc[(match_df['OrderID'].isin(market_id_list)) & (match_df['Type'] != "4"), 'Type'] = typ
@@ -1013,42 +970,20 @@ class Data:
 
 
 if __name__ == "__main__":
-    import cProfile
-    import datetime
-
-    print("Test!")
-    file_path = "../data_sample/processed_data"  # for local user
-    # file_path = "/data/HFData/data_sample" # for test user
-    # file_path = None # for hfdata user
-    # file_path = "/data/HFData/processed_data/data_split_total/"  # for hfdata user
-    stock = "000001.XSHE"
-    year = 2020
-    # date_list = sorted(os.listdir(os.path.join(file_path, stock, str(year))))
-    month = 1
-    day = 2
-
-    # data test
-    # data = Data(stock, year, month, day, file_path=file_path)
-    # data.load_data()
-    # print(data.snap_df)
-    # print(data.order_df)
-    # print(data.trade_df)
-    # data.gen_total_match_data()
-
-    # engine test
+    # Runnable example: replay one stock-day, verify the reconstruction
+    # against the exchange trade feed, and aggregate fills per taker order.
     import time
+
+    file_path = "../data_sample/processed_data"  # adjust to your data layout
+    stock = "000001.XSHE"
+    year, month, day = 2020, 1, 2
 
     engine = Engine(stock, year, month, day, file_path=file_path)
     s_time = time.time()
-    # engine.main_matching_process(check_flag=True, execute_flag=True, snap_flag=False)
     engine.main_matching_process(check_flag=True, execute_flag=True,
                                  snap_flag=True, snap_rule="order_before", snap_level_num=1,
                                  execute_rule="trade_before", execute_level_num=1)
-    # engine.main_matching_process(check_flag=True, execute_flag=True,
-    #                              snap_flag=True, snap_rule="order_before", snap_level_num=1)
-    e_time = time.time()
-    print(e_time - s_time)
-    # cProfile.run("engine.main_matching_process(debug_flag=True, check_flag=True, execute_flag=True)")
+    print(f"matching took {time.time() - s_time:.2f}s")
 
     snap_total_df = pd.DataFrame(engine.order_book.snap_total_list)
     execute_total_df = pd.DataFrame(engine.order_book.execute_total_list)
@@ -1060,18 +995,4 @@ if __name__ == "__main__":
         {'Time': 'last', 'TradeQty': 'sum', 'Direction': 'last',
          "BidPX1": 'last', "OfferPX1": 'last', "BidSize1": 'last', "OfferSize1": 'last'}
     ).reset_index()
-    # snap_total_df['time'] = snap_total_df['time'].apply(
-    #     lambda x: datetime.datetime(year, month, day, int(x // 1e7), int(x // 1e5 % 1e2), int(x // 1e3 % 1e2),
-    #                                 int(x % 1e3 * 1e3)))
-    # snap_total_df_uniquetime = snap_total_df.groupby('time').first().reset_index()
-    # snap_total_df_uniquetime['time'] = snap_total_df_uniquetime['time'].shift(1)
-    # snap_total_df_uniquetime['sendtime'] = snap_total_df_uniquetime['time'] - datetime.timedelta(microseconds=10000)
-    # snap_3s_df = snap_total_df_uniquetime.resample(on='sendtime', rule="3S", closed='right', label='right').last()
-    # for date in date_list:
-    #     month = int(date[:2])
-    #     day = int(date[2:])
-    #     engine = Engine(stock, year, month, day, file_path=file_path)
-    #     engine.main_matching_process(check_flag=True, execute_flag=True)
-
-    print("1")
-    pass
+    print(execute_total_df_agg.head())

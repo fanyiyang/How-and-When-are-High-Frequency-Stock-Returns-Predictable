@@ -42,11 +42,9 @@ def load_raw_data(stockname):
     """Load raw tick data and store merged trades/quotes for a single stock."""
     print(stockname, "load_raw_data")
     start = time.time()
-    files = os.listdir(f"../../data/HFData/HS300_data/{stockname}.XSHE/2020/")
-    files = sorted(files)
-    filesnumber = files
-    for i in range(len(files)):
-        filesnumber[i] = [int(files[i][:2]), int(files[i][2:])]
+    # per-day folders are named MMDD, e.g. "0102"
+    files = sorted(os.listdir(f"../../data/HFData/HS300_data/{stockname}.XSHE/2020/"))
+    filesnumber = [[int(name[:2]), int(name[2:])] for name in files]
     file_path = "/data/HFData/HS300_data"
     stock = f"{stockname}.XSHE"
     year = 2020
@@ -60,8 +58,9 @@ def load_raw_data(stockname):
             execute_total_df = pd.DataFrame(engine.order_book.execute_total_list)
             date = pd.to_datetime(f"2020-{month}-{day}")
             datadict[date] = execute_total_df
-        except Exception:
-            print(month, day, stock, "no data")
+        except Exception as exc:
+            # keep going on bad/missing days, but say what actually failed
+            print(f"{stock} 2020-{month:02d}-{day:02d} skipped: {exc!r}")
     fulldata = pd.concat(datadict)
     fulldata.to_csv(f"/data/work/yangsq/dataset_all/{stockname}fulldata.csv")
     use = time.time() - start
@@ -152,6 +151,12 @@ def build_feature_set(stockname):
     ]
 
     def response_calculator(data):
+        """Compute the six forward-return labels.
+
+        ``data`` arrives sorted by DESCENDING time (see build_dataset), so a
+        trailing rolling window here actually aggregates FUTURE trades: each
+        label is mean(price over the next K seconds/trades/shares) / price - 1.
+        """
         data[response_variable] = 0
         data = data.reset_index().set_index("TradesNum")
         data.Return10trades = data.Price.rolling(10).mean() / data.Price - 1
@@ -239,10 +244,13 @@ def build_feature_set(stockname):
         return predictor
 
     def build_dataset(data_original, mode="calendar"):
+        """Build one day's training set: 9 window scales x 12 predictors + 2 labels."""
         data = pd.DataFrame(data_original)
         data = data.dropna(how="any")
         data = data.sort_values("Time", ascending=True)
         data["Volumecum"] = data["TradeQty"].cumsum()
+        # labels are computed on time-DESCENDING data (forward windows),
+        # predictors on time-ASCENDING data (trailing windows)
         data = data.sort_values("Time", ascending=False)
         data = response_calculator(data)
         data = data.sort_values("Time", ascending=True).reset_index()
@@ -268,7 +276,7 @@ def build_feature_set(stockname):
         return trainset
 
     trainset = fulldata.groupby("TradingDay").apply(build_dataset)
-    print(trainset)
+    print(f"trainset built: {trainset.shape[0]} rows x {trainset.shape[1]} columns")
 
     end = time.time()
     use = end - start
@@ -285,4 +293,7 @@ if __name__ == "__main__":
             load_raw_data(stockname)
             build_feature_set(stockname)
         except Exception:
-            pass
+            # keep processing the remaining stocks, but never fail silently
+            import traceback
+
+            traceback.print_exc()

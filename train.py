@@ -20,19 +20,8 @@ warnings.filterwarnings("ignore")
 
 
 def train_model(model, X_train, y_train, X_test, y_test):
+    """Fit ``model`` and return its out-of-sample R^2 on the test split."""
     model.fit(X_train, y_train)
-    if model.__class__.__name__ == "LGBMRegressor" and False:
-        eval_set = [(X_train, y_train), (X_test, y_test)]
-        model.fit(X_train, y_train, eval_set=eval_set, eval_metric="rmse", verbose=False)
-        train_rmse = model.evals_result_["training"]["rmse"]
-        test_rmse = model.evals_result_["valid_1"]["rmse"]
-        plt.plot(train_rmse, label="train")
-        plt.plot(test_rmse, label="test")
-        plt.xlabel("Boosting Iterations")
-        plt.ylabel("RMSE")
-        plt.title("LightGBM RMSE Curve")
-        plt.legend()
-        plt.show()
     if model.__class__.__name__ == "MLPRegressor":
         loss_values = model.loss_curve_
 
@@ -48,6 +37,7 @@ def train_model(model, X_train, y_train, X_test, y_test):
 
 
 def process_data(Xset, yset1, yset2, all_date, today_index, i):
+    """Slice the i-th rolling 5-day train / 5-day test split and standardize X."""
     X_train = Xset.loc[all_date[(today_index + i * 5) : (today_index + (i + 1) * 5)]]
     y_train1 = yset1.loc[all_date[(today_index + i * 5) : (today_index + (i + 1) * 5)]]
     y_train2 = yset2.loc[all_date[(today_index + i * 5) : (today_index + (i + 1) * 5)]]
@@ -63,6 +53,7 @@ def process_data(Xset, yset1, yset2, all_date, today_index, i):
 
 
 def get_best_param(score_func, n_trials=5, timeout=600, n_jobs=1):
+    """Grid-search one hyperparameter for the given score function via Optuna."""
     if score_func.__name__ == "RFscore":
         searchspace = {"x": [3, 4, 5, 6, 7]}
     elif score_func.__name__ == "Lassoscore":
@@ -73,10 +64,11 @@ def get_best_param(score_func, n_trials=5, timeout=600, n_jobs=1):
         searchspace = {"x": [3, 4, 5, 6, 7]}
     elif score_func.__name__ == "Lightscore":
         searchspace = {"x": [2**i - 1 for i in range(2, 8)]}
+    # default parameter 1 is kept when even the best trial scores below -2
     para, score = 1, -2
     study = optuna.create_study(sampler=optuna.samplers.GridSampler(searchspace), direction="maximize")
     study.optimize(score_func, n_trials=n_trials, timeout=timeout, n_jobs=n_jobs)
-    print(f"{score_func.__name__} timeout 之前试验次数: {len(study.trials)}")
+    print(f"{score_func.__name__}: {len(study.trials)} trials finished before timeout")
     if study.best_value > score:
         para = study.best_params["x"]
         score = study.best_value
@@ -84,6 +76,13 @@ def get_best_param(score_func, n_trials=5, timeout=600, n_jobs=1):
 
 
 def run_training(stockname):
+    """Rolling training loop for one stock.
+
+    Every 20 trading days: re-tune hyperparameters for Lasso/RF/Ridge/LightGBM
+    on the preceding days, then for each of the next 20 days train on the
+    trailing 5 days and record out-of-sample R^2 (plus feature importances and
+    Lasso/RF predictions) on that day.
+    """
     print(stockname)
     start_time = time.time()
 
@@ -114,11 +113,13 @@ def run_training(stockname):
         axis=1,
     )
     new_df.set_index(new_df.columns[0], inplace=True, drop=True)
-    print(trainset)
+    print(f"trainset loaded: {trainset.shape[0]} rows x {trainset.shape[1]} columns")
     trainset = trainset.set_index("level_0")
     trainset = trainset.drop(trainset.columns[0], axis=1)
     trainset = trainset.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "_", str(x)))
 
+    # 108 predictors = 9 window scales x 12 microstructure signals,
+    # followed by the two return labels (e.g. Return5s, Return30s)
     Xset = trainset.iloc[:, :108]
     yset1 = trainset.iloc[:, 108]
     yset2 = trainset.iloc[:, 109]
@@ -136,7 +137,7 @@ def run_training(stockname):
     print(f"read_pickle completed! Used {total_time}s.\nlen(all_date) = ", len(all_date))
     print("---Training/Hyper Parameter Tuning starts:---")
     if len(all_date) < 5:
-        raise ValueError
+        raise ValueError(f"need at least 5 trading days of data, got {len(all_date)}")
     today_index = 0
 
     def RFscore(trial):
@@ -180,6 +181,8 @@ def run_training(stockname):
             count += train_model(ridge, X_train, y_train2, X_test, y_test2)
         return count
 
+    # XGBscore / NNscore are kept for manual experiments; the default
+    # training loop below only tunes Lasso, RF, Ridge and LightGBM.
     def XGBscore(trial):
         nonlocal today_index
         x = trial.suggest_categorical("x", [3, 4, 5, 6, 7])
@@ -278,6 +281,7 @@ def run_training(stockname):
         columns=["lasso", "rf", "ridge", "light"],
     )
     for i in range(20, len(all_date) - 20, 20):
+        # re-tune on the 20 days before day i, then predict days i .. i+19
         print(f"--{i}th cycle of the year--")
         Lassopara = getparaLasso(i - 20)
         RFpara = getparaRF(i - 20)
